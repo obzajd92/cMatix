@@ -1,0 +1,239 @@
+name: Cross-Platform Performance, Trivy Scanning, GHCR Delivery & Production Rollbacks
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  lint-and-validate-style:
+    name: Code Style Compliance Check (clang-format)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository Code
+      uses: actions/checkout@v4
+
+    - name: Install Clang-Format Linter Tool
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-format
+
+    - name: Verify Code Style (Fail on Misalignments)
+      run: |
+        clang-format --style=LLVM --dry-run --Werror Ritz.c test.c
+
+  security-scan-and-profile:
+    name: Container Build, Trivy Security Scan & Performance Profiling
+    needs: lint-and-validate-style
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository Code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx Framework
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Local Image for Security Evaluation
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile
+        push: false
+        tags: ghcr.io/${{ github.repository }}/numeric-benchmark:local
+        load: true
+        cache-from: type=gha,scope=matrix-bench-cache
+        cache-to: type=gha,mode=max,scope=matrix-bench-cache
+
+    - name: Run Trivy Security Vulnerability Scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'ghcr.io/${{ github.repository }}/numeric-benchmark:local'
+        format: 'table'
+        exit-code: '1'
+        ignore-unfixed: true
+        vuln-type: 'os,library'
+        severity: 'CRITICAL,HIGH'
+
+    - name: Authenticate to GitHub Container Registry (GHCR)
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Push Safe and Immutable Container Image to GHCR
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: ghcr.io/${{ github.repository }}/numeric-benchmark:latest
+        cache-from: type=gha,scope=matrix-bench-cache
+
+    - name: Prune Old and Untagged Package Versions from GHCR
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      uses: actions/delete-package-versions@v5
+      with:
+        package-name: 'numeric-benchmark'
+        package-type: 'container'
+        min-versions-to-keep: 3
+        delete-only-untagged-versions: 'true'
+
+    - name: Execute Profiling Suite inside Compiled Container Environment
+      run: |
+        docker run --entrypoint /workspace/test_suite_O3 ghcr.io/${{ github.repository }}/numeric-benchmark:local --benchmark -O3 > raw_output.log 2>&1
+        cat raw_output.log
+        grep -E "BENCHMARK_TIME|PEAK_STACK_BYTES|PEAK_HEAP_BYTES" raw_output.log > platform_bench.txt || true
+
+    - name: Stash Profiling Snippet
+      uses: actions/upload-artifact@v4
+      with:
+        name: bench-container-metrics
+        path: platform_bench.txt
+
+  aggregate-alert-and-enforce:
+    name: Run Monitor Analytics & Enforce PR Quality Blockers
+    needs: security-scan-and-profile
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # Fetches full history so git rollbacks have reference frames to traverse
+
+    - name: Retrieve Historical Runtime Baseline (Cache)
+      id: history-cache
+      uses: actions/cache@v4
+      with:
+        path: historical_baseline.json
+        key: perf-baseline-${{ github.repository }}-${{ github.ref_name }}
+        restore-keys: |
+          perf-baseline-${{ github.repository }}-
+
+    - name: Retrieve Stashed Container Metric Snippets
+      uses: actions/download-artifact@v4
+      with:
+        path: collected_metrics
+
+    - name: Process Performance Trends & Handle Production Rollback Automation
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_SHA: ${{ github.sha }}
+        GH_REPO: ${{ github.repository }}
+        GH_EVENT: ${{ github.event_name }}
+        GH_REF: ${{ github.ref }}
+      shell: bash
+      run: |
+        python3 - << 'EOF'
+        import os
+        import json
+        import sys
+        import urllib.request
+        import subprocess
+
+        data = {
+            "platforms": {"container-env": {"peak_stack_bytes": 0, "peak_heap_bytes": 0}}
+        }
+
+        metrics_file = "collected_metrics/bench-container-metrics/platform_bench.txt"
+        if os.path.exists(metrics_file):
+            with open(metrics_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("BENCHMARK_TIME"):
+                        parts = line.split("|")
+                        if len(parts) == 3:
+                            data["platforms"]["container-env"][parts] = float(parts)
+                    elif line.startswith("PEAK_STACK_BYTES"):
+                        data["platforms"]["container-env"]["peak_stack_bytes"] = int(line.split("|"))
+                    elif line.startswith("PEAK_HEAP_BYTES"):
+                        data["platforms"]["container-env"]["peak_heap_bytes"] = int(line.split("|"))
+
+        flags = data["platforms"]["container-env"]
+        if "-O3" in flags:
+            flags["thread_efficiency_index"] = round((1.0 / flags["-O3"]) * 10, 2)
+
+        degradation_str = "N/A (First tracked baseline execution loop setup)"
+        cache_file = "historical_baseline.json"
+        performance_regression_triggered = False
+        
+        if os.path.exists(cache_file):
+            with open(cache_file, "r") as hf:
+                try:
+                    hist_data = json.load(hf)
+                    hist_flags = hist_data["platforms"]["container-env"]
+                    if "-O3" in flags and "-O3" in hist_flags:
+                        degradation = ((flags["-O3"] - hist_flags["-O3"]) / hist_flags["-O3"]) * 100.0
+                        flags["degradation_vs_historical_pct"] = round(degradation, 2)
+                        degradation_str = f"{degradation:+.2f}%"
+                        
+                        if degradation > 15.0:
+                            degradation_str += " ❌ **[CRITICAL REGRESSION HIGH]**"
+                            performance_regression_triggered = True
+                        else:
+                            degradation_str += " ✅ **[STABLE]**"
+                except Exception as e:
+                    print("Error checking cache files:", e)
+
+        # Only update the cache file if performance is stable, preventing a bad run from becoming the baseline
+        if not performance_regression_triggered:
+            with open(cache_file, "w") as out_cache:
+                json.dump(data, out_cache, indent=2)
+
+        token = os.environ.get("GITHUB_TOKEN")
+        sha = os.environ.get("GH_SHA")
+        repo = os.environ.get("GH_REPO")
+        event = os.environ.get("GH_EVENT")
+        ref = os.environ.get("GH_REF")
+
+        if token and sha and repo:
+            commit_url = f"https://github.com{repo}/commits/{sha}/comments"
+            comment_body = (
+                f"### 📊 Automated Performance & Structural Validation Trends\n\n"
+                f"| Metric Parameter Attributes | Current Run Execution Value |\n"
+                f"| :--- | :--- |\n"
+                f"| ⏱️ **Execution Speed (-O3)** | `{flags.get('-O3', 0.0):.4f}s` |\n"
+                f"| 📈 **Subspace Deviation Delta (Trend)** | {degradation_str} |\n"
+                f"| 🧵 **Thread Performance Efficiency Index** | `{flags.get('thread_efficiency_index', 0.0)}` |\n"
+                f"| 📦 **Peak Memory Heap Demands** | `{flags.get('peak_heap_bytes', 0)} Bytes` |\n"
+                f"| 💾 **Peak Static Stack Footprint** | `{flags.get('peak_stack_bytes', 0)} Bytes` |\n\n"
+                f"*Generated automatically via continuous delivery validation loop workflows.*"
+            )
+            req = urllib.request.Request(
+                commit_url, data=json.dumps({"body": comment_body}).encode("utf-8"),
+                headers={"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"}
+            )
+            try:
+                urllib.request.urlopen(req)
+            except Exception as e:
+                print("Failed to post commit comment:", e)
+
+        # =================================================================
+        # AUTOMATED PRODUCTION ROLLBACK ENGINE
+        # =================================================================
+        if performance_regression_triggered:
+            print("\n🚨 [CRITICAL REGRESSION Ceilings Cross-Matched] 🚨")
+            
+            if event == "push" and ref == "refs/heads/main":
+                print("-> Detection triggered inside production branch 'main'!")
+                print("-> Executing automated code rollback procedures to restore performance baseline stability...")
+                
+                try:
+                    # Authenticate and configure git profile dynamically
+                    subprocess.run(["git", "config", "global", "user.name", "GitHub Actions Bot"], check=True)
+                    subprocess.run(["git", "config", "global", "user.email", "actions@github.com"], check=True)
+                    
+                    # Revert the malicious/breaking commit automatically
+                    print("-> Generating Git Revert layer...")
+                    subprocess.run(["git", "revert", "--no-edit", "HEAD"], check=True)
+                    
+# Force push back onto remote origin main branch to instantly restore production efficiencyremote_url = f"https://x-access-token:{token}@github.com{repo}.git"print("-> Pushing rollback layer safely back onto main branch...")subprocess.run(["git", "push", remote_url, "HEAD:main"], check=True)print("✅ Production rollback completed successfully. Prior runtime stability restored.")except Exception as g_err:print("Failed to execute git automated fallback loop:", g_err)sys.exit(1) # Break current job sequence to reflect red failure status flagsEOF
