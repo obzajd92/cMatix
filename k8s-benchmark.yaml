@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: matrix-performance-benchmark
+  namespace: development
+  labels:
+    app: numeric-benchmark
+spec:
+  template:
+    metadata:
+      labels:
+        app: numeric-benchmark
+    spec:
+      containers:
+      - name: benchmark-runner
+        image: myregistry.local/numeric-benchmark:v1.0.0
+        imagePullPolicy: IfNotPresent
+        # Captures explicit instruction (I) and Data (D) cache-miss parameters without kernel performance hooks
+        command: ["valgrind"]
+        args: [
+          "--tool=cachegrind", 
+          "--cachegrind-out-file=/workspace/cache_results.txt", 
+          "/workspace/test_suite_O3", 
+          "--benchmark", 
+          "-O3"
+        ]
+        resources:
+          limits:
+            cpu: "2.0"       # Isolates container core bounds to minimize host multi-tenant scheduling noise
+            memory: 512Mi
+          requests:
+            cpu: "1.0"
+            memory: 256Mi
+      restartPolicy: Never
+  backoffLimit: 2
